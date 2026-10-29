@@ -1,0 +1,12 @@
+App(
+    appid="lutron_cca",
+    name="Lutron CCA",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="lutron_cca_app",
+    stack_size=4 * 1024,
+    fap_category="Sub-GHz",
+    fap_version="0.1",
+    fap_description="Lutron Clear Connect (433 MHz) packet-mode sniffer and transmitter",
+    fap_author="lutron-protocols",
+    requires=["gui", "storage", "notification"],
+)
