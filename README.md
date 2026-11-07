@@ -31,7 +31,7 @@ radio channel (starts on 26 every time you open the app), how many times each pa
 
 #### setup flow
 
-if you have lights connected to a lutron vive hub:
+if you have lights connected to lutron vive hubs:
 1. go to one of your hubs and hold your flipper near it in sniff / learn mode until you see a `VIVE` command appear
 2. _**if the signal strength** (which you can find by hitting the right arrow while hovering over the command and looking at the top right) **seems reasonable relative to the distance you were holding it from the hub**_ (see the sniff / learn section), click the command and add it to a group
 3. repeat until you have added all the hubs you want to control to your group
