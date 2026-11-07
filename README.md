@@ -14,13 +14,16 @@ it's built for official flipper firmware - custom firmware will probably give "A
 
 ## how to use
 
-**groups.** make a group, name it, and add lights. a light is either a vive zone (hub id + zone) or a pico. pick a group to run on, off, level, raise, and lower commands for everything in the group at once. _(picos get skipped for level commands since they don't have a level button. raise/lower commands are also very granular, so they might be extremely slow to change!)_
-
-**sniff.** shows every lutron packet nearby. press ok on a `VIVE` line (a hub command) or a `BTN` line (a pico press) and it asks which group to add that light to or if you want to a new one.
+#### sniff / learn
+shows every lutron packet nearby. press ok on a `VIVE` line (a hub command) or a `BTN` line (a pico press) and it asks which group to add that light to or if you want to a new one.
 
 to catch a vive zone, leave sniff open near the hub until it sends something.
 
-**settings.** radio channel (starts on 26 every time you open the app), how many times each packet repeats, logging to the sd card, and whether sniff shows corrupted packets.
+#### control (groups)
+make a group, name it, and add lights. a light is either a vive zone (hub id + zone) or a pico. pick a group to run on, off, level, raise, and lower commands for everything in the group at once. _(picos get skipped for level commands since they don't have a level button. raise/lower commands are also very granular, so they might be extremely slow to change!)_
+
+#### settings
+radio channel (starts on 26 every time you open the app), how many times each packet repeats, logging to the sd card, and whether sniff shows corrupted packets.
 
 ## building the app
 
