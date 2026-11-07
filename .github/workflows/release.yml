@@ -1,0 +1,56 @@
+# Builds the Flipper app on every push to main and publishes it as a GitHub release.
+#
+# Each push gets its own release, tagged build-<run number>, with lutron_controller.fap attached.
+# The newest one is marked "Latest", so the download link
+#   https://github.com/<owner>/<repo>/releases/latest/download/lutron_controller.fap
+# always points at the most recent build.
+
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create tags and releases
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # let every pushed commit get its release, in order
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Run codec tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O1 -I. -o test/codec_test test/codec_test.c cca_codec.c
+          ./test/codec_test
+
+      - name: Build .fap
+        id: build-app
+        uses: flipperdevices/flipperzero-ufbt-action@v0.1
+        with:
+          sdk-channel: release # official Flipper firmware, the same channel used for local builds
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }} (${{ github.sha }})
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Automatic build of ${{ github.sha }} on `${{ github.ref_name }}`.
+
+            Built against Flipper SDK `${{ steps.build-app.outputs.suffix }}` (API ${{ steps.build-app.outputs.api-version }}). Install by copying `lutron_controller.fap` to `SD Card/apps/Sub-GHz/` on a Flipper running official firmware with a matching API version.
+
+            Commit message:
+
+            ${{ github.event.head_commit.message }}
+          files: ${{ steps.build-app.outputs.fap-dir }}/*.fap
+          fail_on_unmatched_files: true
