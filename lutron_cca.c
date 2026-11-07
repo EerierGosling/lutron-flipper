@@ -11,8 +11,9 @@
  *
  * Screens:
  *   Sniff / Learn  - live decoded packets; OK on a packet copies its IDs/zone into settings
- *   Control        - send level / on / off (both systems), raise / lower (Vive) as the hub
- *   Vive pairs     - user-entered (hub ID, zone) pairs; Send level / ON / OFF command every pair
+ *   Control        - named light sets (each a list of Vive hub + zone pairs); pick a set,
+ *                    then on / off / level / raise / lower every light in it at once
+ *   Control adv.   - single zone/target: level / on / off, raise / lower, Pico buttons, batches
  *   Settings       - system, hub ID, target ID, zone, channel, TX slot, repeats, logging
  */
 #include <furi.h>
@@ -24,6 +25,7 @@
 #include <gui/modules/variable_item_list.h>
 #include <gui/modules/byte_input.h>
 #include <gui/modules/dialog_ex.h>
+#include <gui/modules/text_input.h>
 #include <gui/modules/widget.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
@@ -45,14 +47,21 @@
 #define MAX_TARGETS 8
 #define MAX_PICO_OFF_IDS 20
 #define MAX_PAIRS 16
-#define MAX_TX_PHASES MAX_PAIRS /* one phase per pair; >= 2 for press/release and hold/step */
+#define MAX_TX_PHASES (MAX_PAIRS * 2) /* set raise/lower: a hold and a step phase per light */
 #define PAIRS_ADD_INDEX 0xFF
+#define MAX_SETS 10
+#define SET_NAME_LEN 20
+#define SETS_NEW_INDEX 0xFE
 #define SNIFF_RING 24
 #define FRAME_MS 75
 
 /* Edit this list to add the Pico IDs that belong to your lights. */
+/* Placeholder IDs so the list is never empty (an empty list does not compile). Replace them
+ * with the Pico IDs shown in Sniff (`BTN ... <id>`). Keep real IDs out of public commits:
+ * CCA has no encryption, so a Pico ID is all anyone needs to impersonate that Pico. */
 static const uint8_t PICO_OFF_IDS[][4] = {
-    
+    {0x01, 0x23, 0x45, 0x67},
+    {0x89, 0xAB, 0xCD, 0xEF},
 };
 #define PICO_OFF_ID_COUNT (sizeof(PICO_OFF_IDS) / sizeof(PICO_OFF_IDS[0]))
 
@@ -67,6 +76,10 @@ typedef enum {
     ViewIdPairEdit,
     ViewIdPairHub,
     ViewIdPairZone,
+    ViewIdSets,
+    ViewIdSetControl,
+    ViewIdSetName,
+    ViewIdConfirm,
 } ViewId;
 
 typedef enum {
@@ -74,7 +87,7 @@ typedef enum {
     MenuControl,
     MenuSettings,
     MenuAbout,
-    MenuPairs,
+    MenuSets,
 } MenuIndex;
 
 typedef enum {
@@ -83,7 +96,6 @@ typedef enum {
     CtrlLevel,
     CtrlFade,
     CtrlSendLevel,
-    CtrlOnOffTarget,
     CtrlSendOn,
     CtrlSendOff,
     CtrlPicoOn,
@@ -111,6 +123,21 @@ typedef enum {
     SetExportRaw,
 } SettingsIndex;
 
+/* Light set control screen rows, in display order */
+typedef enum {
+    SetCtlName,
+    SetCtlOn,
+    SetCtlOff,
+    SetCtlLevel,
+    SetCtlFade,
+    SetCtlSendLevel,
+    SetCtlRaise,
+    SetCtlLower,
+    SetCtlLights,
+    SetCtlRename,
+    SetCtlDelete,
+} SetCtlIndex;
+
 typedef enum {
     SystemVive = 0,
     SystemBridge = 1,
@@ -135,6 +162,14 @@ typedef struct {
 } VivePair;
 
 typedef struct {
+    char name[SET_NAME_LEN];
+    VivePair pairs[MAX_PAIRS];
+    uint8_t n_pairs;
+    uint8_t level; /* percent, used by Send level */
+    uint8_t fade_idx; /* index into FADE_QS, used by every command for this set */
+} LightSet;
+
+typedef struct {
     uint8_t system; /* SystemType */
     uint8_t hub[4]; /* packet bytes 2..5 of a hub command, verbatim */
     uint8_t target[4]; /* Caseta/RA3: packet bytes 9..12 of a hub command, verbatim */
@@ -151,14 +186,15 @@ typedef struct {
     uint8_t fade_idx;
     bool log_rx;
     bool show_bad;
-    VivePair pairs[MAX_PAIRS]; /* Send ON / Send OFF command each of these once (Vive) */
-    uint8_t n_pairs;
+    LightSet sets[MAX_SETS]; /* named groups of Vive lights, driven from the Control menu */
+    uint8_t n_sets;
 } AppConfig;
 
 typedef struct {
     uint8_t pkt[CCA_MAX_PKT];
     uint8_t len;
     uint8_t repeats;
+    uint8_t group; /* interleaved sends: phases sharing a group are interleaved, groups run in order */
 } TxPhase;
 
 typedef struct {
@@ -195,12 +231,18 @@ typedef struct {
     DialogEx* pair_dialog;
     ByteInput* pair_hub_input;
     ByteInput* pair_zone_input;
+    Submenu* sets_menu;
+    VariableItemList* set_control;
+    TextInput* set_name_input;
+    DialogEx* confirm_dialog;
 
     VariableItem* item_zone;
     VariableItem* item_target;
     VariableItem* item_level;
     VariableItem* item_fade;
-    VariableItem* item_onoff;
+    VariableItem* item_set_name;
+    VariableItem* item_set_level;
+    VariableItem* item_set_fade;
     VariableItem* item_system;
     VariableItem* item_hub;
     VariableItem* item_zone_setting;
@@ -220,9 +262,13 @@ typedef struct {
     uint8_t* byte_dest;
     uint8_t byte_len;
 
-    /* Vive pairs editor state; strings live here because the GUI keeps the pointers */
+    /* Light set + pairs editor state; strings live here because the GUI keeps the pointers */
+    uint8_t set_sel; /* the set being controlled / edited */
+    uint8_t set_edit_index; /* == cfg.n_sets when creating a new set */
+    char set_name_buf[SET_NAME_LEN];
+    char confirm_text[48];
     uint8_t pair_sel;
-    uint8_t pair_edit_index; /* == cfg.n_pairs when adding a new pair */
+    uint8_t pair_edit_index; /* == current set's n_pairs when adding a new pair */
     uint8_t pair_hub_buf[4];
     uint8_t pair_zone_buf[1];
     char pairs_header[24];
@@ -360,17 +406,34 @@ static void config_save(App* app) {
         flipper_format_write_uint32(ff, "LogRx", &v, 1);
         v = c->show_bad ? 1 : 0;
         flipper_format_write_uint32(ff, "ShowBad", &v, 1);
-        v = c->n_pairs;
-        flipper_format_write_uint32(ff, "NPairs", &v, 1);
-        if(c->n_pairs) {
-            uint8_t hubs[MAX_PAIRS * 4];
-            uint8_t zones[MAX_PAIRS];
-            for(uint8_t i = 0; i < c->n_pairs; i++) {
-                memcpy(hubs + i * 4, c->pairs[i].hub, 4);
-                zones[i] = c->pairs[i].zone;
+        v = c->n_sets;
+        flipper_format_write_uint32(ff, "NSets", &v, 1);
+        char key[20];
+        for(uint8_t i = 0; i < c->n_sets; i++) {
+            const LightSet* st = &c->sets[i];
+            snprintf(key, sizeof(key), "Set%uName", (unsigned)i);
+            flipper_format_write_string_cstr(ff, key, st->name);
+            v = st->n_pairs;
+            snprintf(key, sizeof(key), "Set%uNPairs", (unsigned)i);
+            flipper_format_write_uint32(ff, key, &v, 1);
+            if(st->n_pairs) {
+                uint8_t hubs[MAX_PAIRS * 4];
+                uint8_t zones[MAX_PAIRS];
+                for(uint8_t k = 0; k < st->n_pairs; k++) {
+                    memcpy(hubs + k * 4, st->pairs[k].hub, 4);
+                    zones[k] = st->pairs[k].zone;
+                }
+                snprintf(key, sizeof(key), "Set%uHubs", (unsigned)i);
+                flipper_format_write_hex(ff, key, hubs, (size_t)st->n_pairs * 4);
+                snprintf(key, sizeof(key), "Set%uZones", (unsigned)i);
+                flipper_format_write_hex(ff, key, zones, st->n_pairs);
             }
-            flipper_format_write_hex(ff, "PairHubs", hubs, (size_t)c->n_pairs * 4);
-            flipper_format_write_hex(ff, "PairZones", zones, c->n_pairs);
+            v = st->level;
+            snprintf(key, sizeof(key), "Set%uLevel", (unsigned)i);
+            flipper_format_write_uint32(ff, key, &v, 1);
+            v = st->fade_idx;
+            snprintf(key, sizeof(key), "Set%uFade", (unsigned)i);
+            flipper_format_write_uint32(ff, key, &v, 1);
         }
     } else {
         FURI_LOG_W(TAG, "config save failed");
@@ -411,15 +474,59 @@ static void config_load(App* app) {
         if(flipper_format_read_uint32(ff, "FadeIdx", &v, 1) && v < N_FADES) c->fade_idx = (uint8_t)v;
         if(flipper_format_read_uint32(ff, "LogRx", &v, 1)) c->log_rx = (v != 0);
         if(flipper_format_read_uint32(ff, "ShowBad", &v, 1)) c->show_bad = (v != 0);
-        if(flipper_format_read_uint32(ff, "NPairs", &v, 1) && v > 0 && v <= MAX_PAIRS) {
-            uint8_t hubs[MAX_PAIRS * 4];
-            uint8_t zones[MAX_PAIRS];
-            if(flipper_format_read_hex(ff, "PairHubs", hubs, (size_t)v * 4) &&
-               flipper_format_read_hex(ff, "PairZones", zones, (size_t)v)) {
-                c->n_pairs = (uint8_t)v;
-                for(uint8_t i = 0; i < c->n_pairs; i++) {
-                    memcpy(c->pairs[i].hub, hubs + i * 4, 4);
-                    c->pairs[i].zone = zones[i];
+        /* Light sets. Rewind first: a key missing above leaves the stream at end of file. */
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "NSets", &v, 1) && v <= MAX_SETS) {
+            uint32_t n_sets = v;
+            char key[20];
+            for(uint8_t i = 0; i < n_sets; i++) {
+                LightSet* st = &c->sets[c->n_sets];
+                memset(st, 0, sizeof(*st));
+                st->level = 50;
+                st->fade_idx = 1;
+                snprintf(key, sizeof(key), "Set%uName", (unsigned)i);
+                if(!flipper_format_read_string(ff, key, name)) break;
+                snprintf(st->name, sizeof(st->name), "%s", furi_string_get_cstr(name));
+                snprintf(key, sizeof(key), "Set%uNPairs", (unsigned)i);
+                if(!flipper_format_read_uint32(ff, key, &v, 1) || v > MAX_PAIRS) break;
+                if(v) {
+                    uint8_t hubs[MAX_PAIRS * 4];
+                    uint8_t zones[MAX_PAIRS];
+                    snprintf(key, sizeof(key), "Set%uHubs", (unsigned)i);
+                    if(!flipper_format_read_hex(ff, key, hubs, (size_t)v * 4)) break;
+                    snprintf(key, sizeof(key), "Set%uZones", (unsigned)i);
+                    if(!flipper_format_read_hex(ff, key, zones, (size_t)v)) break;
+                    st->n_pairs = (uint8_t)v;
+                    for(uint8_t k = 0; k < st->n_pairs; k++) {
+                        memcpy(st->pairs[k].hub, hubs + k * 4, 4);
+                        st->pairs[k].zone = zones[k];
+                    }
+                }
+                snprintf(key, sizeof(key), "Set%uLevel", (unsigned)i);
+                if(flipper_format_read_uint32(ff, key, &v, 1) && v <= 100) st->level = (uint8_t)v;
+                snprintf(key, sizeof(key), "Set%uFade", (unsigned)i);
+                if(flipper_format_read_uint32(ff, key, &v, 1) && v < N_FADES) st->fade_idx = (uint8_t)v;
+                c->n_sets++;
+            }
+        } else {
+            /* Configs from before light sets kept one global pairs list: turn it into a set. */
+            flipper_format_rewind(ff);
+            if(flipper_format_read_uint32(ff, "NPairs", &v, 1) && v > 0 && v <= MAX_PAIRS) {
+                uint8_t hubs[MAX_PAIRS * 4];
+                uint8_t zones[MAX_PAIRS];
+                if(flipper_format_read_hex(ff, "PairHubs", hubs, (size_t)v * 4) &&
+                   flipper_format_read_hex(ff, "PairZones", zones, (size_t)v)) {
+                    LightSet* st = &c->sets[0];
+                    memset(st, 0, sizeof(*st));
+                    snprintf(st->name, sizeof(st->name), "Lights");
+                    st->level = c->level;
+                    st->fade_idx = c->fade_idx;
+                    st->n_pairs = (uint8_t)v;
+                    for(uint8_t k = 0; k < st->n_pairs; k++) {
+                        memcpy(st->pairs[k].hub, hubs + k * 4, 4);
+                        st->pairs[k].zone = zones[k];
+                    }
+                    c->n_sets = 1;
                 }
             }
         }
@@ -467,33 +574,67 @@ static void request_tx_level(App* app, uint8_t pct) {
     notification_message(app->notif, &sequence_blink_start_blue);
 }
 
+static bool tx_busy(App* app) {
+    return app->tx_pending || app->pico_batch_active || app->target_batch_active;
+}
+
 /*
- * Vive pairs: one level command per (hub, zone) pair, all built with the same type byte.
- * The worker interleaves them (copy 1 of every pair, then copy 2, ...) so every light
- * switches within the first pass instead of waiting for earlier pairs' full bursts.
+ * Light set level: one Vive level command per light in the set, all with the same type byte.
+ * The worker interleaves them (copy 1 of every light, then copy 2, ...) so every light switches
+ * within the first pass instead of waiting for earlier lights' full bursts.
  */
-static void request_tx_pairs(App* app, uint8_t pct) {
-    if(app->tx_pending || app->pico_batch_active || app->target_batch_active) return;
-    if(app->cfg.n_pairs == 0) return;
+static bool request_tx_set_level(App* app, const LightSet* set, uint8_t pct) {
+    if(tx_busy(app) || set->n_pairs == 0) return false;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     uint8_t type_byte = next_type_byte(app, 0x89);
-    uint8_t n = app->cfg.n_pairs < MAX_TX_PHASES ? app->cfg.n_pairs : MAX_TX_PHASES;
-    for(uint8_t i = 0; i < n; i++) {
+    for(uint8_t i = 0; i < set->n_pairs; i++) {
         TxPhase* ph = &app->tx_phase[i];
         ph->len = (uint8_t)cca_build_vive_level(
             ph->pkt,
-            app->cfg.pairs[i].hub,
-            app->cfg.pairs[i].zone,
+            set->pairs[i].hub,
+            set->pairs[i].zone,
             cca_pct_to_level16(pct),
-            FADE_QS[app->cfg.fade_idx],
+            FADE_QS[set->fade_idx],
             type_byte);
         ph->repeats = app->cfg.repeats;
+        ph->group = 0;
     }
-    app->tx_nphases = n;
+    app->tx_nphases = set->n_pairs;
     app->tx_interleave = true;
     furi_mutex_release(app->mutex);
     app->tx_pending = true;
     notification_message(app->notif, &sequence_blink_start_blue);
+    return true;
+}
+
+/*
+ * Light set raise/lower: the documented Vive two-phase dim for every light. All hold-starts go
+ * out first (group 0, interleaved), then all dim steps (group 1), since a dimmer ignores steps
+ * that are not preceded by a hold-start.
+ */
+static bool request_tx_set_dim(App* app, const LightSet* set, bool raise) {
+    if(tx_busy(app) || set->n_pairs == 0) return false;
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    uint8_t type_byte = next_type_byte(app, 0x89);
+    uint8_t n = set->n_pairs;
+    for(uint8_t i = 0; i < n; i++) {
+        TxPhase* hold = &app->tx_phase[i];
+        hold->len = (uint8_t)cca_build_vive_dim(
+            hold->pkt, set->pairs[i].hub, set->pairs[i].zone, raise, true, type_byte);
+        hold->repeats = VIVE_HOLD_REPEATS;
+        hold->group = 0;
+        TxPhase* step = &app->tx_phase[n + i];
+        step->len = (uint8_t)cca_build_vive_dim(
+            step->pkt, set->pairs[i].hub, set->pairs[i].zone, raise, false, type_byte);
+        step->repeats = VIVE_STEP_REPEATS;
+        step->group = 1;
+    }
+    app->tx_nphases = (uint8_t)(n * 2);
+    app->tx_interleave = true;
+    furi_mutex_release(app->mutex);
+    app->tx_pending = true;
+    notification_message(app->notif, &sequence_blink_start_blue);
+    return true;
 }
 
 static void request_tx_dim(App* app, bool raise) {
@@ -629,16 +770,23 @@ static void worker_do_tx(App* app) {
     uint32_t next = furi_get_tick();
     uint16_t sent = 0;
     if(interleave) {
-        uint8_t max_rep = 0;
-        for(uint8_t p = 0; p < nphases; p++) {
-            if(phases[p].repeats > max_rep) max_rep = phases[p].repeats;
-        }
-        for(uint8_t r = 0; r < max_rep && ok; r++) {
-            for(uint8_t p = 0; p < nphases && ok; p++) {
-                if(r >= phases[p].repeats) continue;
-                ok = tx_send_one(app, &phases[p], slot, enc, sizeof(enc), &next);
-                if(ok) sent++;
+        /* Phases sharing a group are interleaved; groups run one after another. */
+        uint8_t start = 0;
+        while(start < nphases && ok) {
+            uint8_t end = start;
+            uint8_t max_rep = 0;
+            while(end < nphases && phases[end].group == phases[start].group) {
+                if(phases[end].repeats > max_rep) max_rep = phases[end].repeats;
+                end++;
             }
+            for(uint8_t r = 0; r < max_rep && ok; r++) {
+                for(uint8_t p = start; p < end && ok; p++) {
+                    if(r >= phases[p].repeats) continue;
+                    ok = tx_send_one(app, &phases[p], slot, enc, sizeof(enc), &next);
+                    if(ok) sent++;
+                }
+            }
+            start = end;
         }
     } else {
         for(uint8_t p = 0; p < nphases && ok; p++) {
@@ -1005,18 +1153,6 @@ static void control_refresh(App* app) {
 
     variable_item_set_current_value_index(app->item_fade, app->cfg.fade_idx);
     variable_item_set_current_value_text(app->item_fade, FADE_NAMES[app->cfg.fade_idx]);
-
-    /* Where Send level / ON / OFF go: every Vive pair if any are set, else the zone/target above */
-    if(app->cfg.system == SystemVive && app->cfg.n_pairs > 0) {
-        snprintf(buf, sizeof(buf), "%u pair%s", (unsigned)app->cfg.n_pairs, app->cfg.n_pairs == 1 ? "" : "s");
-    } else {
-        snprintf(buf, sizeof(buf), "%s", app->cfg.system == SystemVive ? "Zone above" : "Target above");
-    }
-    variable_item_set_current_value_text(app->item_onoff, buf);
-}
-
-static bool use_pairs_for_onoff(App* app) {
-    return app->cfg.system == SystemVive && app->cfg.n_pairs > 0;
 }
 
 static void control_zone_changed(VariableItem* item) {
@@ -1047,22 +1183,13 @@ static void control_enter(void* ctx, uint32_t index) {
     App* app = ctx;
     switch(index) {
     case CtrlSendLevel:
-        if(use_pairs_for_onoff(app))
-            request_tx_pairs(app, app->cfg.level);
-        else
-            request_tx_level(app, app->cfg.level);
+        request_tx_level(app, app->cfg.level);
         break;
     case CtrlSendOn:
-        if(use_pairs_for_onoff(app))
-            request_tx_pairs(app, 100);
-        else
-            request_tx_level(app, 100);
+        request_tx_level(app, 100);
         break;
     case CtrlSendOff:
-        if(use_pairs_for_onoff(app))
-            request_tx_pairs(app, 0);
-        else
-            request_tx_level(app, 0);
+        request_tx_level(app, 0);
         break;
     case CtrlPicoOn:
         request_tx_pico_button(app, 0x02);
@@ -1289,24 +1416,228 @@ static void settings_enter(void* ctx, uint32_t index) {
     }
 }
 
-/* ------------------------------------------------------------------ vive pairs view */
+/* ------------------------------------------------------------------ light sets */
 
+static void sets_menu_callback(void* ctx, uint32_t index);
 static void pairs_menu_callback(void* ctx, uint32_t index);
+static void set_control_enter(void* ctx, uint32_t index);
+
+static LightSet* cur_set(App* app) {
+    if(app->set_sel >= app->cfg.n_sets) app->set_sel = 0;
+    return &app->cfg.sets[app->set_sel];
+}
+
+static void sets_rebuild(App* app) {
+    submenu_reset(app->sets_menu);
+    submenu_set_header(app->sets_menu, "Light sets");
+    for(uint8_t i = 0; i < app->cfg.n_sets; i++) {
+        submenu_add_item(app->sets_menu, app->cfg.sets[i].name, i, sets_menu_callback, app);
+    }
+    if(app->cfg.n_sets < MAX_SETS) {
+        submenu_add_item(app->sets_menu, "+ New set", SETS_NEW_INDEX, sets_menu_callback, app);
+    }
+}
+
+static void set_level_changed(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    LightSet* st = cur_set(app);
+    char buf[8];
+    st->level = (uint8_t)(variable_item_get_current_value_index(item) * 5);
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)st->level);
+    variable_item_set_current_value_text(item, buf);
+    config_save(app);
+}
+
+static void set_fade_changed(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    LightSet* st = cur_set(app);
+    st->fade_idx = variable_item_get_current_value_index(item);
+    variable_item_set_current_value_text(item, FADE_NAMES[st->fade_idx]);
+    config_save(app);
+}
+
+/* Rebuilds the set control screen for the current set and selects row `select`. */
+static void set_control_rebuild(App* app, uint8_t select) {
+    VariableItemList* l = app->set_control;
+    variable_item_list_reset(l);
+    variable_item_list_set_enter_callback(l, set_control_enter, app);
+    if(app->cfg.n_sets == 0) return;
+
+    LightSet* st = cur_set(app);
+    char buf[16];
+    app->item_set_name = variable_item_list_add(l, st->name, 1, NULL, app);
+    snprintf(buf, sizeof(buf), "%u light%s", (unsigned)st->n_pairs, st->n_pairs == 1 ? "" : "s");
+    variable_item_set_current_value_text(app->item_set_name, buf);
+
+    variable_item_list_add(l, "On", 0, NULL, app);
+    variable_item_list_add(l, "Off", 0, NULL, app);
+
+    app->item_set_level = variable_item_list_add(l, "Level", 21, set_level_changed, app);
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)st->level);
+    variable_item_set_current_value_index(app->item_set_level, st->level / 5);
+    variable_item_set_current_value_text(app->item_set_level, buf);
+
+    app->item_set_fade = variable_item_list_add(l, "Fade", N_FADES, set_fade_changed, app);
+    variable_item_set_current_value_index(app->item_set_fade, st->fade_idx);
+    variable_item_set_current_value_text(app->item_set_fade, FADE_NAMES[st->fade_idx]);
+
+    variable_item_list_add(l, "Send level", 0, NULL, app);
+    variable_item_list_add(l, "Raise", 0, NULL, app);
+    variable_item_list_add(l, "Lower", 0, NULL, app);
+    variable_item_list_add(l, "Edit lights", 0, NULL, app);
+    variable_item_list_add(l, "Rename", 0, NULL, app);
+    variable_item_list_add(l, "Delete set", 0, NULL, app);
+    variable_item_list_set_selected_item(l, select);
+}
+
+static void set_name_done(void* ctx);
+
+/* index < n_sets renames that set; index == n_sets names a new one. */
+static void set_start_name(App* app, uint8_t index) {
+    bool rename = index < app->cfg.n_sets;
+    app->set_edit_index = index;
+    if(rename) {
+        snprintf(app->set_name_buf, sizeof(app->set_name_buf), "%s", app->cfg.sets[index].name);
+    } else {
+        snprintf(app->set_name_buf, sizeof(app->set_name_buf), "Set %u", (unsigned)(app->cfg.n_sets + 1));
+    }
+    text_input_set_header_text(app->set_name_input, rename ? "Rename set" : "Name the new set");
+    text_input_set_result_callback(
+        app->set_name_input, set_name_done, app, app->set_name_buf, sizeof(app->set_name_buf), !rename);
+    view_dispatcher_switch_to_view(app->vd, ViewIdSetName);
+}
+
+static void pairs_rebuild(App* app);
+
+static void set_name_done(void* ctx) {
+    App* app = ctx;
+    uint8_t i = app->set_edit_index;
+    if(i < app->cfg.n_sets) {
+        snprintf(app->cfg.sets[i].name, SET_NAME_LEN, "%s", app->set_name_buf);
+        config_save(app);
+        sets_rebuild(app);
+        set_control_rebuild(app, SetCtlRename);
+        view_dispatcher_switch_to_view(app->vd, ViewIdSetControl);
+        return;
+    }
+    if(app->cfg.n_sets >= MAX_SETS) {
+        notification_message(app->notif, &sequence_error);
+        view_dispatcher_switch_to_view(app->vd, ViewIdSets);
+        return;
+    }
+    LightSet* st = &app->cfg.sets[app->cfg.n_sets];
+    memset(st, 0, sizeof(*st));
+    snprintf(st->name, sizeof(st->name), "%s", app->set_name_buf);
+    st->level = 50;
+    st->fade_idx = 1;
+    app->set_sel = app->cfg.n_sets++;
+    config_save(app);
+    sets_rebuild(app);
+    set_control_rebuild(app, SetCtlLights);
+    /* A new set has no lights yet: go straight to adding them. Back leads to its controls. */
+    pairs_rebuild(app);
+    view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
+}
+
+static void set_confirm_delete(App* app) {
+    LightSet* st = cur_set(app);
+    snprintf(app->confirm_text, sizeof(app->confirm_text), "Delete \"%s\"?", st->name);
+    dialog_ex_set_header(app->confirm_dialog, "Delete set", 64, 2, AlignCenter, AlignTop);
+    dialog_ex_set_text(app->confirm_dialog, app->confirm_text, 64, 28, AlignCenter, AlignCenter);
+    dialog_ex_set_left_button_text(app->confirm_dialog, "Cancel");
+    dialog_ex_set_right_button_text(app->confirm_dialog, "Delete");
+    view_dispatcher_switch_to_view(app->vd, ViewIdConfirm);
+}
+
+static void confirm_dialog_callback(DialogExResult result, void* ctx) {
+    App* app = ctx;
+    if(result == DialogExResultRight && app->set_sel < app->cfg.n_sets) {
+        uint8_t i = app->set_sel;
+        memmove(
+            &app->cfg.sets[i],
+            &app->cfg.sets[i + 1],
+            (size_t)(app->cfg.n_sets - i - 1) * sizeof(LightSet));
+        app->cfg.n_sets--;
+        app->set_sel = 0;
+        config_save(app);
+        sets_rebuild(app);
+        notification_message(app->notif, &sequence_single_vibro);
+        view_dispatcher_switch_to_view(app->vd, ViewIdSets);
+    } else if(result == DialogExResultLeft) {
+        view_dispatcher_switch_to_view(app->vd, ViewIdSetControl);
+    }
+}
+
+static void set_control_enter(void* ctx, uint32_t index) {
+    App* app = ctx;
+    if(app->cfg.n_sets == 0) return;
+    LightSet* st = cur_set(app);
+    bool ok = true;
+    switch(index) {
+    case SetCtlOn:
+        ok = request_tx_set_level(app, st, 100);
+        break;
+    case SetCtlOff:
+        ok = request_tx_set_level(app, st, 0);
+        break;
+    case SetCtlSendLevel:
+        ok = request_tx_set_level(app, st, st->level);
+        break;
+    case SetCtlRaise:
+        ok = request_tx_set_dim(app, st, true);
+        break;
+    case SetCtlLower:
+        ok = request_tx_set_dim(app, st, false);
+        break;
+    case SetCtlLights:
+        pairs_rebuild(app);
+        view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
+        break;
+    case SetCtlRename:
+        set_start_name(app, app->set_sel);
+        break;
+    case SetCtlDelete:
+        set_confirm_delete(app);
+        break;
+    default:
+        break;
+    }
+    /* Refused: a send is already running, or the set has no lights yet. */
+    if(!ok) notification_message(app->notif, &sequence_error);
+}
+
+static void sets_menu_callback(void* ctx, uint32_t index) {
+    App* app = ctx;
+    if(index == SETS_NEW_INDEX) {
+        if(app->cfg.n_sets < MAX_SETS)
+            set_start_name(app, app->cfg.n_sets);
+        else
+            notification_message(app->notif, &sequence_error);
+        return;
+    }
+    if(index >= app->cfg.n_sets) return;
+    app->set_sel = (uint8_t)index;
+    set_control_rebuild(app, SetCtlOn);
+    view_dispatcher_switch_to_view(app->vd, ViewIdSetControl);
+}
+
+/* ------------------------------------------------------------------ set lights (pairs) editor */
 
 static void pairs_rebuild(App* app) {
+    LightSet* st = cur_set(app);
     submenu_reset(app->pairs_menu);
     snprintf(
         app->pairs_header,
         sizeof(app->pairs_header),
-        "Vive pairs %u/%u",
-        (unsigned)app->cfg.n_pairs,
+        "Lights %u/%u",
+        (unsigned)st->n_pairs,
         (unsigned)MAX_PAIRS);
     submenu_set_header(app->pairs_menu, app->pairs_header);
-    if(app->cfg.n_pairs < MAX_PAIRS) {
-        submenu_add_item(app->pairs_menu, "+ Add pair", PAIRS_ADD_INDEX, pairs_menu_callback, app);
+    if(st->n_pairs < MAX_PAIRS) {
+        submenu_add_item(app->pairs_menu, "+ Add light", PAIRS_ADD_INDEX, pairs_menu_callback, app);
     }
-    for(uint8_t i = 0; i < app->cfg.n_pairs; i++) {
-        const VivePair* pr = &app->cfg.pairs[i];
+    for(uint8_t i = 0; i < st->n_pairs; i++) {
+        const VivePair* pr = &st->pairs[i];
         snprintf(
             app->pair_labels[i],
             sizeof(app->pair_labels[i]),
@@ -1323,30 +1654,30 @@ static void pairs_rebuild(App* app) {
 
 static void pair_zone_done(void* ctx) {
     App* app = ctx;
+    LightSet* st = cur_set(app);
     VivePair entered;
     memcpy(entered.hub, app->pair_hub_buf, 4);
     entered.zone = app->pair_zone_buf[0];
 
     uint8_t i = app->pair_edit_index;
-    bool adding = i >= app->cfg.n_pairs;
+    bool adding = i >= st->n_pairs;
     bool duplicate = false;
-    for(uint8_t k = 0; k < app->cfg.n_pairs; k++) {
-        if(k != i && memcmp(app->cfg.pairs[k].hub, entered.hub, 4) == 0 &&
-           app->cfg.pairs[k].zone == entered.zone) {
+    for(uint8_t k = 0; k < st->n_pairs; k++) {
+        if(k != i && memcmp(st->pairs[k].hub, entered.hub, 4) == 0 && st->pairs[k].zone == entered.zone) {
             duplicate = true;
         }
     }
 
-    if(duplicate || (adding && app->cfg.n_pairs >= MAX_PAIRS)) {
+    if(duplicate || (adding && st->n_pairs >= MAX_PAIRS)) {
         notification_message(app->notif, &sequence_error);
     } else {
-        if(adding) i = app->cfg.n_pairs++;
-        app->cfg.pairs[i] = entered;
+        if(adding) i = st->n_pairs++;
+        st->pairs[i] = entered;
         config_save(app);
         notification_message(app->notif, &sequence_single_vibro);
     }
     pairs_rebuild(app);
-    control_refresh(app);
+    set_control_rebuild(app, SetCtlLights);
     view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
 }
 
@@ -1354,44 +1685,47 @@ static void pair_hub_done(void* ctx) {
     App* app = ctx;
     byte_input_set_result_callback(
         app->pair_zone_input, pair_zone_done, NULL, app, app->pair_zone_buf, 1);
-    byte_input_set_header_text(app->pair_zone_input, "Pair zone (pkt byte 12)");
+    byte_input_set_header_text(app->pair_zone_input, "Light zone (pkt byte 12)");
     view_dispatcher_switch_to_view(app->vd, ViewIdPairZone);
 }
 
 static void pair_start_edit(App* app, uint8_t index) {
+    LightSet* st = cur_set(app);
     app->pair_edit_index = index;
-    if(index < app->cfg.n_pairs) {
-        memcpy(app->pair_hub_buf, app->cfg.pairs[index].hub, 4);
-        app->pair_zone_buf[0] = app->cfg.pairs[index].zone;
+    if(index < st->n_pairs) {
+        memcpy(app->pair_hub_buf, st->pairs[index].hub, 4);
+        app->pair_zone_buf[0] = st->pairs[index].zone;
     } else {
-        /* New pair: start from the Settings hub/zone, since most pairs share one hub. */
-        memcpy(app->pair_hub_buf, app->cfg.hub, 4);
+        /* New light: start from this set's last hub (lights in a set usually share one hub),
+         * or the Settings hub for the first light. */
+        memcpy(app->pair_hub_buf, st->n_pairs ? st->pairs[st->n_pairs - 1].hub : app->cfg.hub, 4);
         app->pair_zone_buf[0] = app->cfg.zone;
     }
     byte_input_set_result_callback(app->pair_hub_input, pair_hub_done, NULL, app, app->pair_hub_buf, 4);
-    byte_input_set_header_text(app->pair_hub_input, "Pair hub ID (pkt bytes 2-5)");
+    byte_input_set_header_text(app->pair_hub_input, "Light hub ID (bytes 2-5)");
     view_dispatcher_switch_to_view(app->vd, ViewIdPairHub);
 }
 
 static void pairs_menu_callback(void* ctx, uint32_t index) {
     App* app = ctx;
+    LightSet* st = cur_set(app);
     if(index == PAIRS_ADD_INDEX) {
-        if(app->cfg.n_pairs < MAX_PAIRS)
-            pair_start_edit(app, app->cfg.n_pairs);
+        if(st->n_pairs < MAX_PAIRS)
+            pair_start_edit(app, st->n_pairs);
         else
             notification_message(app->notif, &sequence_error);
         return;
     }
-    if(index >= app->cfg.n_pairs) return;
+    if(index >= st->n_pairs) return;
 
     app->pair_sel = (uint8_t)index;
-    const VivePair* pr = &app->cfg.pairs[index];
+    const VivePair* pr = &st->pairs[index];
     snprintf(
         app->pair_dialog_header,
         sizeof(app->pair_dialog_header),
-        "Pair %u of %u",
+        "Light %u of %u",
         (unsigned)(index + 1),
-        (unsigned)app->cfg.n_pairs);
+        (unsigned)st->n_pairs);
     snprintf(
         app->pair_dialog_text,
         sizeof(app->pair_dialog_text),
@@ -1410,20 +1744,18 @@ static void pairs_menu_callback(void* ctx, uint32_t index) {
 
 static void pair_dialog_callback(DialogExResult result, void* ctx) {
     App* app = ctx;
+    LightSet* st = cur_set(app);
     uint8_t i = app->pair_sel;
-    if(i >= app->cfg.n_pairs) {
+    if(i >= st->n_pairs) {
         view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
         return;
     }
     if(result == DialogExResultLeft) {
-        memmove(
-            &app->cfg.pairs[i],
-            &app->cfg.pairs[i + 1],
-            (size_t)(app->cfg.n_pairs - i - 1) * sizeof(VivePair));
-        app->cfg.n_pairs--;
+        memmove(&st->pairs[i], &st->pairs[i + 1], (size_t)(st->n_pairs - i - 1) * sizeof(VivePair));
+        st->n_pairs--;
         config_save(app);
         pairs_rebuild(app);
-        control_refresh(app);
+        set_control_rebuild(app, SetCtlLights);
         notification_message(app->notif, &sequence_single_vibro);
         view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
     } else if(result == DialogExResultRight) {
@@ -1453,6 +1785,16 @@ static uint32_t nav_pairs(void* ctx) {
     return ViewIdPairs;
 }
 
+static uint32_t nav_sets(void* ctx) {
+    UNUSED(ctx);
+    return ViewIdSets;
+}
+
+static uint32_t nav_set_control(void* ctx) {
+    UNUSED(ctx);
+    return ViewIdSetControl;
+}
+
 static void menu_callback(void* ctx, uint32_t index) {
     App* app = ctx;
     switch(index) {
@@ -1463,9 +1805,9 @@ static void menu_callback(void* ctx, uint32_t index) {
         control_refresh(app);
         view_dispatcher_switch_to_view(app->vd, ViewIdControl);
         break;
-    case MenuPairs:
-        pairs_rebuild(app);
-        view_dispatcher_switch_to_view(app->vd, ViewIdPairs);
+    case MenuSets:
+        sets_rebuild(app);
+        view_dispatcher_switch_to_view(app->vd, ViewIdSets);
         break;
     case MenuSettings:
         settings_refresh(app);
@@ -1499,8 +1841,8 @@ static App* app_alloc(void) {
     app->menu = submenu_alloc();
     submenu_set_header(app->menu, "Lutron CCA");
     submenu_add_item(app->menu, "Sniff / Learn", MenuSniff, menu_callback, app);
-    submenu_add_item(app->menu, "Control", MenuControl, menu_callback, app);
-    submenu_add_item(app->menu, "Vive pairs", MenuPairs, menu_callback, app);
+    submenu_add_item(app->menu, "Control", MenuSets, menu_callback, app);
+    submenu_add_item(app->menu, "Control advanced", MenuControl, menu_callback, app);
     submenu_add_item(app->menu, "Settings", MenuSettings, menu_callback, app);
     submenu_add_item(app->menu, "About", MenuAbout, menu_callback, app);
     view_set_previous_callback(submenu_get_view(app->menu), nav_exit);
@@ -1525,7 +1867,6 @@ static App* app_alloc(void) {
     app->item_level = variable_item_list_add(app->control, "Level", 21, control_level_changed, app);
     app->item_fade = variable_item_list_add(app->control, "Fade", N_FADES, control_fade_changed, app);
     variable_item_list_add(app->control, "Send level", 0, NULL, app);
-    app->item_onoff = variable_item_list_add(app->control, "Sends to", 1, NULL, app);
     variable_item_list_add(app->control, "Send ON", 0, NULL, app);
     variable_item_list_add(app->control, "Send OFF", 0, NULL, app);
     variable_item_list_add(app->control, "Send Pico ON", 0, NULL, app);
@@ -1560,9 +1901,29 @@ static App* app_alloc(void) {
     view_set_previous_callback(variable_item_list_get_view(app->settings), nav_menu);
     view_dispatcher_add_view(app->vd, ViewIdSettings, variable_item_list_get_view(app->settings));
 
-    /* Vive pairs: list, per-pair Delete/Edit dialog, hub then zone byte entry */
+    /* Light sets: list of named sets, per-set control screen, name entry, delete confirmation */
+    app->sets_menu = submenu_alloc();
+    view_set_previous_callback(submenu_get_view(app->sets_menu), nav_menu);
+    view_dispatcher_add_view(app->vd, ViewIdSets, submenu_get_view(app->sets_menu));
+
+    app->set_control = variable_item_list_alloc();
+    view_set_previous_callback(variable_item_list_get_view(app->set_control), nav_sets);
+    view_dispatcher_add_view(app->vd, ViewIdSetControl, variable_item_list_get_view(app->set_control));
+
+    app->set_name_input = text_input_alloc();
+    text_input_set_minimum_length(app->set_name_input, 1);
+    view_set_previous_callback(text_input_get_view(app->set_name_input), nav_sets);
+    view_dispatcher_add_view(app->vd, ViewIdSetName, text_input_get_view(app->set_name_input));
+
+    app->confirm_dialog = dialog_ex_alloc();
+    dialog_ex_set_context(app->confirm_dialog, app);
+    dialog_ex_set_result_callback(app->confirm_dialog, confirm_dialog_callback);
+    view_set_previous_callback(dialog_ex_get_view(app->confirm_dialog), nav_set_control);
+    view_dispatcher_add_view(app->vd, ViewIdConfirm, dialog_ex_get_view(app->confirm_dialog));
+
+    /* Set lights editor: list, per-light Delete/Edit dialog, hub then zone byte entry */
     app->pairs_menu = submenu_alloc();
-    view_set_previous_callback(submenu_get_view(app->pairs_menu), nav_menu);
+    view_set_previous_callback(submenu_get_view(app->pairs_menu), nav_set_control);
     view_dispatcher_add_view(app->vd, ViewIdPairs, submenu_get_view(app->pairs_menu));
 
     app->pair_dialog = dialog_ex_alloc();
@@ -1578,7 +1939,7 @@ static App* app_alloc(void) {
     app->pair_zone_input = byte_input_alloc();
     view_set_previous_callback(byte_input_get_view(app->pair_zone_input), nav_pairs);
     view_dispatcher_add_view(app->vd, ViewIdPairZone, byte_input_get_view(app->pair_zone_input));
-    pairs_rebuild(app);
+    sets_rebuild(app);
 
     /* Byte input */
     app->byte_input = byte_input_alloc();
@@ -1610,10 +1971,12 @@ static App* app_alloc(void) {
         "as the hub, N repeats at\n"
         "75 ms. Raise/Lower (Vive)\n"
         "= 6 hold + 12 step pkts.\n\n"
-        "Vive pairs: Send level,\n"
-        "ON and OFF command every\n"
-        "hub+zone pair once per\n"
-        "press.\n\n"
+        "Control: pick a named\n"
+        "light set, then On / Off /\n"
+        "Level / Raise / Lower hit\n"
+        "every light in it.\n"
+        "Control advanced: one\n"
+        "zone/target, Pico, lists.\n\n"
         "Bad-CRC packets hidden\n"
         "unless Show bad CRC = On.\n\n"
         "Log: apps_data/lutron_cca/\n"
@@ -1637,7 +2000,15 @@ static void app_free(App* app) {
     view_dispatcher_remove_view(app->vd, ViewIdPairEdit);
     view_dispatcher_remove_view(app->vd, ViewIdPairHub);
     view_dispatcher_remove_view(app->vd, ViewIdPairZone);
+    view_dispatcher_remove_view(app->vd, ViewIdSets);
+    view_dispatcher_remove_view(app->vd, ViewIdSetControl);
+    view_dispatcher_remove_view(app->vd, ViewIdSetName);
+    view_dispatcher_remove_view(app->vd, ViewIdConfirm);
 
+    submenu_free(app->sets_menu);
+    variable_item_list_free(app->set_control);
+    text_input_free(app->set_name_input);
+    dialog_ex_free(app->confirm_dialog);
     submenu_free(app->pairs_menu);
     dialog_ex_free(app->pair_dialog);
     byte_input_free(app->pair_hub_input);

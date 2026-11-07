@@ -52,7 +52,31 @@ with a `?` at the right edge. Every packet is appended to
 `SD Card/apps_data/lutron_cca/rx_log.txt` as `tick rssi=-62 crc=ok err=0 <hex>` when
 logging is on.
 
-**Control.** Zone (Vive) or Target (Caseta) cycles through learned values, `*` marks the
+**Control.** Named light sets for Vive. Each set is a list of up to 16 lights, and each light
+is a hub ID (packet bytes 2–5) plus a zone (packet byte 12), so one set can span several hubs.
+Up to 10 sets are stored in `config.txt`.
+
+- **Pick a set** from the list to open its controls: **On**, **Off**, **Level** and **Fade**
+  (left/right to change, remembered per set), **Send level**, **Raise**, **Lower**,
+  **Edit lights**, **Rename** and **Delete set**. The top row shows the set's name and how many
+  lights it has.
+- **+ New set** asks for a name, then opens the light editor. **+ Add light** asks for the hub
+  ID, then the zone. A new light starts from the set's last hub, or the Settings hub for the
+  first one. Selecting a light offers **Delete** or **Edit**. Duplicate lights are refused.
+- **On / Off / Send level** send one Vive level command per light, as a burst of `Repeats`
+  copies. The copies are interleaved (copy 1 of every light, then copy 2, and so on) so every
+  light switches within the first pass. Packets stay 75 ms apart, so a press takes
+  lights × Repeats × 75 ms, for example 4 lights × 11 repeats ≈ 3.3 s.
+- **Raise / Lower** send all the hold-start packets first, then all the dim steps, since a
+  Vive dimmer ignores steps without a preceding hold-start. That is lights × 18 × 75 ms,
+  about 5.4 s for 4 lights.
+- A press is refused with a red flash if the set has no lights yet or another send is still
+  running.
+
+Configs from earlier builds that had a single "Vive pairs" list load it as a set named
+**Lights**.
+
+**Control advanced.** The single-target screen. Zone (Vive) or Target (Caseta) cycles through learned values, `*` marks the
 manually entered one. Level (0–100 % in steps of 5), Fade (0.25 s to 10 s), then
 Send level / Send ON / Send OFF, Send Pico ON / Send Pico OFF, and Raise / Lower for Vive.
 Set the Pico ID in Settings to the 8-digit ID shown in a `BTN` packet, then select a Pico
@@ -61,7 +85,10 @@ action to transmit that press and release as the Pico. Each send transmits as th
 For a fixed group of Pico IDs, edit `PICO_OFF_IDS` in `lutron_cca.c`, rebuild, and use
 **Start Pico OFF list**. The batch sends action byte `0x06` on each OFF press, followed by
 the normal release packet. It cycles through the list repeatedly until **Stop Pico OFF list**
-is selected; the list is limited to 20 IDs. Each send transmits as the hub:
+is selected; the list is limited to 20 IDs. The list ships with two placeholder IDs
+(`01234567`, `89ABCDEF`) because an empty list does not compile; replace them with your own,
+and keep real IDs out of public commits, since a Pico ID is all anyone needs to impersonate
+that Pico. Each send transmits as the hub:
 
 With **System** set to `Caseta/RA3`, **Start Target OFF list** uses the same hardcoded list
 as target/load IDs and sends hub OFF commands to each one. It repeats until **Stop Target OFF
@@ -73,24 +100,8 @@ successive commands. Raise/Lower follows the documented Vive two-phase sequence:
 hold-start packets (format 0x09) then 12 dim-step packets (format 0x0B); the hold-start is
 required or the dimmer ignores the steps. LED blinks blue while sending, then green (sent)
 or red (radio refused, usually the Flipper's region lock).
-
-**Vive pairs.** A list of up to 16 hub ID + zone pairs you type in yourself, for lights that
-belong to more than one hub or zones you want switched together. Open **Vive pairs** from the
-main menu, choose **+ Add pair**, enter the 4-byte hub ID (packet bytes 2–5) and then the
-1-byte zone (packet byte 12). A new pair starts from the hub and zone in Settings, since most
-pairs share one hub. Selecting an existing pair offers **Delete** or **Edit**. Duplicate pairs
-are refused. The list is saved in `config.txt`.
-
-With System set to Vive and at least one pair in the list, **Send level**, **Send ON** and
-**Send OFF** command every pair once per press instead of the single zone above; the Control
-screen's **Sends to** row shows which applies. Each pair gets one level command (the Level row's
-percentage, or 100 % / 0 % for ON / OFF, with the selected Fade), sent as a normal burst of
-`Repeats` copies. The copies are interleaved — copy 1
-of every pair, then copy 2, and so on — so every light switches within the first pass rather
-than waiting for earlier pairs' full bursts. Packets stay 75 ms apart, so a press takes
-pairs × Repeats × 75 ms in total, for example 4 pairs × 11 repeats ≈ 3.3 s. Lower Repeats to
-make it faster at the cost of reliability. Raise and Lower still use the single zone selected
-above.
+Send level, ON, OFF, Raise and Lower here go only to the single zone or target selected at the
+top. Use **Control** to switch groups of lights.
 
 **Settings.** System (Vive / Caseta-RA3), Hub ID, Zone, Target ID, Pico ID (hex byte
 entry), Channel (Lutron channels 5–56, default 26), TX slot (0–7), Repeats (1–16),
