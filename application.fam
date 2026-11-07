@@ -1,8 +1,10 @@
 App(
-    appid="lutron_cca",
-    name="Lutron CCA",
+    appid="lutron_controller",
+    name="Lutron Controller",
     apptype=FlipperAppType.EXTERNAL,
-    entry_point="lutron_cca_app",
+    entry_point="lutron_controller_app",
+    # Only the app sources: test/codec_test.c is a host program with its own main().
+    sources=["lutron_controller.c", "cca_codec.c", "cca_radio.c"],
     stack_size=4 * 1024,
     fap_category="Sub-GHz",
     fap_version="0.1",

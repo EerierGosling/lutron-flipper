@@ -602,16 +602,31 @@ size_t cca_build_button_long(
     pkt[10] = button;
     pkt[11] = 0x01; /* ACTION_RELEASE */
     memcpy(pkt + 12, device_id, 4);
-    pkt[17] = 0x40; /* QS_CLASS_LEVEL */
-    pkt[18] = 0x00; /* QS_TYPE_HOLD */
-    pkt[19] = (uint8_t)(0x1E + button); /* QS_PRESET_BASE + button */
+    pkt[16] = 0x00;
+    if(button == 0x05 || button == 0x06) {
+        /* RAISE / LOWER: dim class, execute, direction, then the two trailing bytes real Picos
+         * send (bytes 17-21 = 42 02 01 00 16 raise, 42 02 00 00 43 lower). Ported from
+         * cca_build_button_long in lutron-protocols firmware/src/cca/cca_tx_builder.h. */
+        pkt[17] = 0x42; /* QS_CLASS_DIM */
+        pkt[18] = 0x02; /* QS_TYPE_EXECUTE */
+        pkt[19] = button == 0x05 ? 0x01 : 0x00; /* direction: 1 raise, 0 lower */
+        pkt[20] = 0x00;
+        pkt[21] = button == 0x05 ? 0x16 : 0x43;
+    } else {
+        pkt[17] = 0x40; /* QS_CLASS_LEVEL */
+        pkt[18] = 0x00; /* QS_TYPE_HOLD */
+        pkt[19] = (uint8_t)(0x1E + button); /* QS_PRESET_BASE + button */
+    }
     return 22;
 }
 
 bool cca_is_vive_cmd(const CcaPacket* p) {
     if(p->type < 0x88 || p->type > 0x8B || !p->has_format || p->len < 18) return false;
-    if(p->raw[8] != 0x00 || p->raw[13] != 0xEF) return false;
-    return p->format == 0x0E || p->format == 0x09 || p->format == 0x0B;
+    /* Vive hub framing: byte 8 = 0x00 (Pico packets of the same types use 0x03) and the 0xEF
+     * group marker right after the zone byte. Any format with that framing counts: real hubs
+     * also send format 0x0A (bytes 14-17 = 47 06 FF 00, CC padding), which the repo's docs
+     * do not describe, alongside the documented 0x0E level / 0x09 hold / 0x0B step. */
+    return p->raw[8] == 0x00 && p->raw[13] == 0xEF;
 }
 
 bool cca_is_bridge_cmd(const CcaPacket* p) {
@@ -689,17 +704,16 @@ void cca_describe(const CcaPacket* p, char* out, size_t n) {
         return;
     }
     if(cca_is_vive_cmd(p)) {
+        /* Zone before hub: the hub ID is the part most likely to be clipped on screen. */
+        hex4(r + 2, a);
         if(f == 0x0E) {
             uint16_t l16 = (uint16_t)((r[16] << 8) | r[17]);
-            snprintf(out, n, "VIVE %u%% z%02X", (unsigned)cca_level16_to_pct(l16), (unsigned)r[12]);
-        } else {
             snprintf(
-                out,
-                n,
-                "VIVE %s %s z%02X",
-                f == 0x09 ? "hold" : "step",
-                r[16] == 0x03 ? "up" : "down",
-                (unsigned)r[12]);
+                out, n, "VIVE %u%% z%02X %s", (unsigned)cca_level16_to_pct(l16), (unsigned)r[12], a);
+        } else if(f == 0x09 || f == 0x0B) {
+            snprintf(out, n, "VIVE %s z%02X %s", r[16] == 0x03 ? "up" : "dn", (unsigned)r[12], a);
+        } else {
+            snprintf(out, n, "VIVE f%02X z%02X %s", (unsigned)f, (unsigned)r[12], a);
         }
         return;
     }

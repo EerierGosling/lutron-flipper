@@ -192,7 +192,7 @@ int main(void) {
         CHECK(cca_is_vive_cmd(&p) && !cca_is_bridge_cmd(&p), "vive detection");
         char desc[32];
         cca_describe(&p, desc, sizeof(desc));
-        CHECK(strcmp(desc, "VIVE 75% z38") == 0, "vive describe: '%s'", desc);
+        CHECK(strcmp(desc, "VIVE 75% z38 12345678") == 0, "vive describe: '%s'", desc);
 
         n = cca_build_vive_dim(pkt, hub, 0x38, true, true, 0x8A);
         CHECK(n == 22 && pkt[7] == 0x09 && pkt[14] == 0x42 && pkt[15] == 0x00 && pkt[16] == 0x03 && pkt[13] == 0xEF,
@@ -202,10 +202,25 @@ int main(void) {
         make_fifo(enc, enc_len, 0, fifo);
         CHECK(cca_decode(fifo, CCA_RX_LEN, &p) && p.crc_ok && cca_is_vive_cmd(&p), "vive hold decode");
         cca_describe(&p, desc, sizeof(desc));
-        CHECK(strcmp(desc, "VIVE hold up z38") == 0, "vive hold describe: '%s'", desc);
+        CHECK(strcmp(desc, "VIVE up z38 12345678") == 0, "vive hold describe: '%s'", desc);
 
         n = cca_build_vive_dim(pkt, hub, 0x05, false, false, 0x8B);
         CHECK(pkt[7] == 0x0B && pkt[15] == 0x02 && pkt[16] == 0x02, "vive dim-step layout");
+
+        /* Format 0x0A as observed from a real Vive hub (bytes 14-21 = 47 06 FF 00 CC CC CC CC).
+         * Synthetic hub ID: keep real hub IDs out of the repo, they are enough to impersonate it. */
+        {
+            uint8_t v0a[24] = {0x89, 0x00, 0x12, 0x34, 0x56, 0x78, 0x21, 0x0A, 0x00, 0x00, 0x00, 0x00,
+                               0x50, 0xEF, 0x47, 0x06, 0xFF, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0, 0};
+            cca_append_crc(v0a, 22);
+            enc_len = cca_n81_encode(v0a, 24, enc, sizeof(enc));
+            make_fifo(enc, enc_len, 3, fifo);
+            CHECK(cca_decode(fifo, CCA_RX_LEN, &p) && p.crc_ok && memcmp(p.raw, v0a, 24) == 0,
+                  "vive f0A roundtrip (0xCC padding is real data, not error placeholders)");
+            CHECK(cca_is_vive_cmd(&p) && !cca_is_bridge_cmd(&p), "vive f0A detected as vive");
+            cca_describe(&p, desc, sizeof(desc));
+            CHECK(strcmp(desc, "VIVE f0A z50 12345678") == 0, "vive f0A describe: '%s'", desc);
+        }
 
         /* A Pico long-format packet (byte 8 = 0x03) must not be mistaken for a Vive command */
         uint8_t pico[24] = {0x89, 0x01, 0x06, 0xFD, 0xEF, 0xF4, 0x21, 0x0E, 0x03, 0x00, 0x02, 0x01,
@@ -231,6 +246,36 @@ int main(void) {
         enc_len = cca_n81_encode(pkt, 24, enc, sizeof(enc));
         make_fifo(enc, enc_len, 4, fifo);
         CHECK(cca_decode(fifo, CCA_RX_LEN, &p) && cca_is_bridge_cmd(&p) && !cca_is_vive_cmd(&p), "bridge detection");
+    }
+
+    /* 9. Pico long-format (release) payloads match the CCA reference table, bytes 17-21:
+     *    ON 40 00 20 00 00, FAVORITE 40 00 21 00 00, OFF 40 00 22 00 00,
+     *    RAISE 42 02 01 00 16, LOWER 42 02 00 00 43. */
+    {
+        static const struct {
+            uint8_t button;
+            uint8_t payload[5];
+        } cases[] = {
+            {0x02, {0x40, 0x00, 0x20, 0x00, 0x00}},
+            {0x03, {0x40, 0x00, 0x21, 0x00, 0x00}},
+            {0x04, {0x40, 0x00, 0x22, 0x00, 0x00}},
+            {0x05, {0x42, 0x02, 0x01, 0x00, 0x16}},
+            {0x06, {0x42, 0x02, 0x00, 0x00, 0x43}},
+        };
+        uint8_t id[4] = {0x01, 0x23, 0x45, 0x67};
+        for(size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            uint8_t pkt[CCA_MAX_PKT];
+            memset(pkt, 0xAA, sizeof(pkt));
+            size_t n = cca_build_button_long(pkt, id, cases[c].button, 0x89);
+            CHECK(n == 22, "button %02X long len %zu", cases[c].button, n);
+            CHECK(pkt[7] == 0x0E && pkt[8] == 0x03 && pkt[10] == cases[c].button && pkt[11] == 0x01,
+                  "button %02X long header", cases[c].button);
+            CHECK(memcmp(pkt + 2, id, 4) == 0 && memcmp(pkt + 12, id, 4) == 0 && pkt[16] == 0x00,
+                  "button %02X long ids", cases[c].button);
+            CHECK(memcmp(pkt + 17, cases[c].payload, 5) == 0,
+                  "button %02X payload %02X %02X %02X %02X %02X",
+                  cases[c].button, pkt[17], pkt[18], pkt[19], pkt[20], pkt[21]);
+        }
     }
 
     /* 8. Failed-CRC packets are labelled BAD, never as a protocol type */

@@ -100,6 +100,11 @@ size_t cca_build_button_short(
     uint8_t action,
     uint8_t type_byte);
 
+/*
+ * Pico long-format (release) packet, format 0x0E, 22 bytes. Bytes 17-21 carry the button's
+ * command: 40 00 <0x1E+button> 00 00 (preset) for ON / FAVORITE / OFF, and the dim class
+ * 42 02 01 00 16 (RAISE, 0x05) or 42 02 00 00 43 (LOWER, 0x06), per the CCA reference.
+ */
 size_t cca_build_button_long(
     uint8_t* pkt,
     const uint8_t device_id[4],
