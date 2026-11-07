@@ -17,7 +17,7 @@ it's built for official flipper firmware - custom firmware will probably give "A
 #### sniff / learn
 shows every lutron packet nearby. press ok on a `VIVE` line (a hub command) or a `BTN` line (a pico press) and it asks which group to add that light to or if you want to a new one.
 
-to catch a vive zone, leave sniff open near the hub until it sends something. _**if you're holding the flipper within a foot of the hub, -45-50 dB is typical for the signal strength.**_ signal strengths of -80 or -90 dB are likely significantly further away!
+to catch a vive zone, leave sniff open near the hub until it sends something. _**if you're holding the flipper within a foot of the hub, -45-50 dB is typical for the signal strength. around 5 feet underneath will have a signal strength of ~-55 dB**_ signal strengths of -80 or -90 dB are likely significantly further away!
 
 #### control (groups)
 make a group, name it, and add lights. a light is either a vive zone (hub id + zone) or a pico. pick a group to run on, off, level, raise, and lower commands for everything in the group at once. _(picos get skipped for level commands since they don't have a level button. raise/lower commands are also very granular, so they might be extremely slow to change!)_
